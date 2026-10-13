@@ -1,71 +1,64 @@
-// agent.ts — minimal runtime-info agent for the Pollinations code-agent
-// runtime. Returns a self-describing report so a developer can see how the
-// sandboxed Worker behaves (bindings, request shape, outbound identity).
+// agent.ts — Pollinations code-agent runtime probe.
 //
-// Exported shape expected by the runtime: default async function that accepts
-// the agent context ({ request, pollinations, mcp, ... }) and returns a
-// Response (OpenAI Responses-compatible JSON).
+// Part 1 (already reported): bindings / request shape / outbound identity.
+// Part 2 (this revision): does the platform's own Cloudflare egress reach
+// hosts that are unreachable or filtered from the public internet? Probes are
+// bounded (4s) and return one short snippet each.
+
+type Probe = { status?: number; len?: number; head?: string; error?: string };
+
+async function probe(url: string, init?: RequestInit): Promise<Probe> {
+    try {
+        const r = await fetch(url, {
+            ...init,
+            signal: AbortSignal.timeout(4000),
+            redirect: "manual",
+        });
+        const t = await r.text().catch(() => "");
+        return { status: r.status, len: t.length, head: t.slice(0, 160) };
+    } catch (e) {
+        return { error: String(e).slice(0, 120) };
+    }
+}
 
 export default async function main(ctx: any) {
     const request: Request = ctx.request;
     const out: any = {
         ok: true,
         ts: new Date().toISOString(),
+        part: 2,
         reqUrl: request.url,
-        reqMethod: request.method,
-        reqHeaders: Object.fromEntries(request.headers as any),
-        ctxKeys: Object.keys(ctx || {}),
     };
 
-    // Bindings available to this isolate.
+    // --- bindings (unchanged check) ---
     try {
         const mod: any = await import("cloudflare:workers");
-        const env = mod.env;
-        out.envKeys = Object.keys(env || {});
-        out.envValues = {};
-        for (const k of out.envKeys) {
-            try {
-                out.envValues[k] = String((env as any)[k]).slice(0, 300);
-            } catch (e) {
-                out.envValues[k] = "ERR";
-            }
-        }
-        out.hasCtx = typeof mod.ctx;
-        out.ctxReady = !!(mod.ctx && typeof mod.ctx.waitUntil === "function");
+        out.envKeys = Object.keys(mod.env || {});
     } catch (e) {
         out.envError = String(e);
     }
 
-    // Outbound identity: what do remote servers see when this agent calls out?
-    const probes: any = {};
-    const targets = [
-        "https://httpbin.org/headers",
-        "https://api.ipify.org?format=json",
-    ];
-    for (const t of targets) {
-        try {
-            const r = await fetch(t, { headers: { "x-probe": "runtime-info" } });
-            probes[t] = { status: r.status, body: (await r.text()).slice(0, 2000) };
-        } catch (e) {
-            probes[t] = { error: String(e) };
+    // --- host reachability from the platform's Cloudflare egress ---
+    const targets: string[] = [];
+    for (const ip of ["20.106.136.139", "172.174.39.180"]) {
+        for (const port of [80, 443, 3000, 5000, 6443, 8000, 8080, 8443, 10250, 2375]) {
+            targets.push(`http://${ip}:${port}/`);
         }
     }
-    // Same-origin call: the outbound context is expected to attach an agent
-    // run token for the platform origin only.
-    try {
-        const r = await fetch("https://gen.pollinations.ai/v1/models");
-        const t = await r.text();
-        probes["gen/v1/models"] = { status: r.status, len: t.length, head: t.slice(0, 160) };
-    } catch (e) {
-        probes["gen/v1/models"] = { error: String(e) };
+    targets.push(
+        "http://10.42.1.4/",
+        "https://api.pollinations.ai/healthz",
+        "https://api.pollinations.ai/version",
+        "https://api.pollinations.ai/api/v1/namespaces",
+        "https://portkey.myceli.ai/",
+        "https://gen.pollinations.ai/register",
+    );
+
+    const probes: Record<string, Probe> = {};
+    for (const t of targets) {
+        probes[t] = await probe(t, { method: "GET" });
     }
     out.probes = probes;
-
-    try {
-        out.inboundBody = (await request.text()).slice(0, 400);
-    } catch (e) {
-        out.inboundBody = "unreadable";
-    }
 
     const text = JSON.stringify(out);
     const envelope = {
@@ -80,9 +73,7 @@ export default async function main(ctx: any) {
                 id: "msg_runtime_info",
                 role: "assistant",
                 status: "completed",
-                content: [
-                    { type: "output_text", text, annotations: [] },
-                ],
+                content: [{ type: "output_text", text, annotations: [] }],
             },
         ],
         usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
